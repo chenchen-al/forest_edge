@@ -1,0 +1,1408 @@
+# ------------------------------------------------------------------------------Hum/Nat edge掩膜提取
+rm(list = ls())
+gc(reset = TRUE)
+
+library(terra)
+
+# 1. 读取掩膜栅格
+mask_path <- "D:/Forest_Fragmentation/人为和自然归因/Edge_raster/Nat_Edge_raw2.0/2020_1km/Forest_to_NatEdge_2020_1km.tif"
+mask <- rast(mask_path)
+
+# 2. 读取 LST 栅格（2020 年均值，已为真实值）
+lst_path <- "D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_raw/China_LST_day_2020.tif"
+lst <- rast(lst_path)
+
+# 3. 检查 CRS 是否一致，不一致则重投影 lst 到 mask 的 CRS
+if (!compareGeom(lst, mask, crs = TRUE, stopOnError = FALSE)) {
+  message("CRS 不一致，进行重投影...")
+  lst <- project(vpd, mask, method = "near")
+} else {
+  message("CRS 一致，无需重投影")
+}
+
+# 4. 重采样对齐（确保栅格分辨率和范围匹配）
+lst_aligned <- resample(lst, mask, method = "near")
+
+# 5. 掩膜操作（保留 mask == 1 区域，其他设 NA）
+lst_masked <- mask(lst_aligned, mask, maskvalues = 0, updatevalue = NA)
+
+# 6. 输出路径
+output_path <- "D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_raw/LST_Nat_2020.tif"
+
+# 7. 写出结果，保存为浮点型
+writeRaster(lst_masked, output_path, datatype = "FLT4S", NAflag = -9999, overwrite = TRUE)
+
+cat("✅ 掩膜后的 VST数据已保存至：", output_path, "\n")
+
+# ------------------------------------------------------------------------------9km聚合提取
+library(terra)
+
+# 1. 读取你的 1km 栅格数据
+r <- rast("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_raw/LST_Nat_2020.tif")
+
+# 2. 设置聚合因子（假设原图是1km）
+fact <- 9
+
+# 3. 聚合栅格，分别计算四个统计量
+r_max    <- aggregate(r, fact=fact, fun=max,    na.rm=TRUE)
+r_min    <- aggregate(r, fact=fact, fun=min,    na.rm=TRUE)
+r_mean   <- aggregate(r, fact=fact, fun=mean,   na.rm=TRUE)
+r_median <- aggregate(r, fact=fact, fun=median, na.rm=TRUE)
+
+# 4. 合并成一个多波段栅格
+r_summary <- c(r_max, r_min, r_mean, r_median)
+names(r_summary) <- c("max", "min", "mean", "median")
+
+# 5. 提取所有格网的中心坐标和统计值（保留NA格）
+df <- as.data.frame(r_summary, xy=TRUE, na.rm=FALSE)
+
+# 6. 保存为CSV
+write.csv(df, "D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/data.summary/LST_Nat_2020_9km.csv", row.names=FALSE, na = "NA")
+
+
+# ------------------------------------------------------------------------------9km聚合提取类型合并，去除NA
+# 1. 读取两个 CSV 文件
+hum <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/LST_Hum_2020_9km.csv")
+nat <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/LST_Nat_2020_9km.csv")
+
+# 2. 找出两个文件中都没有 NA 的行（逐行检查）
+# 完整无NA的逻辑：每一行在两个表中都不含NA
+valid_rows <- complete.cases(hum) & complete.cases(nat)
+
+# 3. 筛选出无NA的行
+hum_clean <- hum[valid_rows, ]
+nat_clean <- nat[valid_rows, ]
+
+# 4. 可选：检查筛选结果的行数是否一致
+stopifnot(nrow(hum_clean) == nrow(nat_clean))
+
+# 5. 写出为新的CSV文件
+write.csv(hum_clean, "D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/HumEdge_LST_day_2020_9km_clean.csv", row.names=FALSE)
+write.csv(nat_clean, "D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/NatEdge_LST_day_2020_9km_clean.csv", row.names=FALSE)
+
+# ------------------------------------------------------------------------------差值作图
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/HumEdge_LST_day_2020_9km_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/NatEdge_LST_day_2020_9km_clean.csv")
+
+# 2. 取mean列，计算插值（差值）
+interpolation <- hum_clean$mean - nat_clean$mean
+
+# 3. 计算插值的中位数和95%分位数范围
+median_val <- median(interpolation, na.rm = TRUE)
+x_min <- quantile(interpolation, 0.025, na.rm = TRUE)
+x_max <- quantile(interpolation, 0.975, na.rm = TRUE)
+
+# 打印中位数到控制台
+cat("插值的中位数 =", round(median_val, 4), "\n")
+
+# 4. 构造数据框（ggplot要求）
+df_interp <- data.frame(interpolation = interpolation)
+
+# 5. 绘图
+p <- ggplot(df_interp, aes(x = interpolation)) +
+  geom_density(color = "#1f77b4", linewidth = 1.2) +
+  geom_vline(xintercept = median_val, color = "#ff7f0e", linetype = "dashed", linewidth = 1) +
+  coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, 0.7)) +   # 限制横纵坐标范围
+  labs(x = "∆LST(℃)", y = "Density") +
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.line = element_line(color = "black", linewidth = 1),
+    axis.ticks = element_line(color = "black", linewidth = 1),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+
+# 6. 显示图形
+print(p)
+# 7. （可选）保存图像到本地路径
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/∆LST_day_2020.png",
+       plot = p, width = 10, height = 9, dpi = 600, bg = "white")
+# ------------------------------------------------------------------------------差值作图优化版
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020/HumEdge_LST_day_2020_9km_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020/NatEdge_LST_day_2020_9km_clean.csv")
+
+# 2. 取mean列，计算插值（差值）
+interpolation <- hum_clean$mean - nat_clean$mean
+
+# 3. 计算比例（小于0和大于0）
+prop_less_0 <- mean(interpolation < 0, na.rm = TRUE)
+prop_greater_0 <- mean(interpolation > 0, na.rm = TRUE)
+
+cat("小于 0 的比例 =", round(prop_less_0, 3), "\n")
+cat("大于 0 的比例 =", round(prop_greater_0, 3), "\n")
+
+# 4. 计算95%分位数范围（用于坐标限制）
+x_min <- quantile(interpolation, 0.025, na.rm = TRUE)
+x_max <- quantile(interpolation, 0.975, na.rm = TRUE)
+# 5. 计算密度曲线
+dens <- density(interpolation, na.rm = TRUE)
+df_dens <- data.frame(x = dens$x, y = dens$y)
+
+# 6. 绘图
+p <- ggplot() +
+  # 左边填充 (x < 0, 更浅)
+  geom_area(data = subset(df_dens, x < 0),
+            aes(x = x, y = y), fill = "orange", alpha = 0.4) +
+  # 右边填充 (x >= 0, 更深)
+  geom_area(data = subset(df_dens, x >= 0),
+            aes(x = x, y = y), fill = "orange", alpha = 0.8) +
+  # 黑色虚线 x=0
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1.5) +
+  coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, max(df_dens$y) * 1.05)) +
+  #labs(x = "∆LST(℃)", y = "Density") +
+  theme_minimal(base_size = 35) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 2.5), # 外边框加粗
+    axis.line = element_line(color = "black", linewidth = 1.0),
+    axis.ticks = element_line(color = "black", linewidth = 1.0),
+    axis.text = element_text(color = "black", size = 35),
+   #axis.title = element_text(color = "black", size = 35),
+   axis.title = element_blank(),                           # 隐藏坐标标题
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+# 7. 显示图形
+print(p)
+
+# 8. 保存图像
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020/∆LST_day_2020_优化版.png",
+       plot = p, width = 10, height = 9, dpi = 600, bg = "white")
+# ------------------------------------------------------------------------------叠加曲线
+# 加载包
+library(ggplot2)
+
+# 1. 读取两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020/HumEdge_LST_day_2020_9km_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020/NatEdge_LST_day_2020_9km_clean.csv")
+
+# 2. 提取 mean 列并合并数据框
+hum_df <- data.frame(mean = hum_clean$mean, type = "Hum")
+nat_df <- data.frame(mean = nat_clean$mean, type = "Nat")
+df_all <- rbind(hum_df, nat_df)
+
+hum_mean <- hum_df$mean
+nat_mean <- nat_df$mean
+
+# 3. t 检验
+t_test_result <- t.test(hum_mean, nat_mean, paired = TRUE)
+cat("T 检验结果：\n")
+print(t_test_result)
+
+# 4. 计算中位数与均值
+median_hum <- median(hum_mean, na.rm = TRUE)
+median_nat <- median(nat_mean, na.rm = TRUE)
+mean_hum   <- mean(hum_mean, na.rm = TRUE)
+mean_nat   <- mean(nat_mean, na.rm = TRUE)
+
+cat("\nHum:\n")
+cat("  中位数 =", round(median_hum, 3), "\n")
+cat("  均值   =", round(mean_hum, 3), "\n\n")
+
+cat("Nat:\n")
+cat("  中位数 =", round(median_nat, 3), "\n")
+cat("  均值   =", round(mean_nat, 3), "\n\n")
+
+# 5. 核密度估计，用于确定注释Y值
+dens_hum <- density(hum_mean, na.rm = TRUE)
+dens_nat <- density(nat_mean, na.rm = TRUE)
+
+# 6. 绘图：ggplot2 频率分布曲线
+p <- ggplot(df_all, aes(x = mean, color = type)) +
+  geom_density(linewidth = 1.0) +
+  
+  # 添加中位数虚线
+  geom_vline(xintercept = median_hum, linetype = "dashed", color = "#cc4c02", linewidth = 1) +
+  geom_vline(xintercept = median_nat, linetype = "dashed", color = "#01665e", linewidth = 1) +
+  
+  # 坐标轴标签
+  labs(x = "LST(℃)", y = "Density") +
+  
+  coord_cartesian(ylim = c(0, 0.25)) +
+  
+  # 颜色手动设定
+  scale_color_manual(values = c("Hum" = "#cc4c02", "Nat" = "#01665e")) +
+  
+  # 精细化主题设置
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",              # 去掉图例
+    panel.grid = element_blank(),          # 去掉网格线
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),  # 添加外框
+    axis.line = element_line(color = "black", linewidth = 1),                # 添加坐标轴线段
+    axis.ticks = element_line(color = "black", linewidth = 1)                # 坐标轴刻度线
+  )
+
+print(p)
+ggsave(
+  filename = "D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020/LST_day_2020.png",
+  plot = p,
+  width = 10, height = 9, dpi = 600, bg = "white"
+)
+
+# ------------------------------------------------------------------------------分区裁剪
+library(terra)
+
+# 1. 输入路径
+shp_dir <- "D:/Forest_Fragmentation/中国标准地图-审图号GS(2020)4619号-shp格式/六大地理分区"
+tif_path <- "D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020/NatEdge_LST_day_2020.tif"
+out_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020_six_region/NatLST_day_2020_region"
+
+# 创建输出文件夹（如果不存在）
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# 2. 读取参考tif
+r <- rast(tif_path)
+
+# 3. 获取所有shp文件路径
+shp_files <- list.files(shp_dir, pattern = "\\.shp$", full.names = TRUE)
+
+# 检查
+print(shp_files)
+
+# 4. 批量裁剪并导出
+for (shp in shp_files) {
+  # 读取shp
+  region <- vect(shp)
+  
+  # 将shp投影转换到栅格坐标系
+  region <- project(region, crs(r))
+  
+  # 裁剪
+  r_crop <- crop(r, region, mask = TRUE)
+  
+  # 生成输出文件名（根据shp文件名）
+  region_name <- tools::file_path_sans_ext(basename(shp))  # 取文件名去掉扩展名
+  out_file <- file.path(out_dir, paste0("NatLST_2020_day_", region_name, ".tif"))
+  
+  # 保存
+  writeRaster(r_crop, out_file, overwrite = TRUE)
+  
+  cat("已保存:", out_file, "\n")
+}
+
+cat("✅ 所有6个分区裁剪完成！\n")
+
+# ------------------------------------------------------------------------------批量聚合
+library(terra)
+
+# 1. 输入目录
+    tif_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020_six_region/NatLST_day_2020_region"
+    out_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020_six_region/summary_day_csv"
+
+# 创建输出文件夹（如果不存在）
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# 2. 获取所有TIF文件路径
+tif_files <- list.files(tif_dir, pattern = "\\.tif$", full.names = TRUE)
+
+# 检查
+print(tif_files)
+
+# 3. 设置聚合因子（假设原始分辨率是1km -> 9km）
+fact <- 9
+
+# 4. 批量处理
+for (tif in tif_files) {
+  # 读取栅格
+  r <- rast(tif)
+  
+  # 计算四个统计量
+  r_max    <- aggregate(r, fact=fact, fun=max,    na.rm=TRUE)
+  r_min    <- aggregate(r, fact=fact, fun=min,    na.rm=TRUE)
+  r_mean   <- aggregate(r, fact=fact, fun=mean,   na.rm=TRUE)
+  r_median <- aggregate(r, fact=fact, fun=median, na.rm=TRUE)
+  
+  # 合并为多波段栅格
+  r_summary <- c(r_max, r_min, r_mean, r_median)
+  names(r_summary) <- c("max", "min", "mean", "median")
+  
+  # 转换为数据框，保留NA格
+  df <- as.data.frame(r_summary, xy=TRUE, na.rm=FALSE)
+  
+  # 生成输出文件名（基于TIF文件名）
+  region_name <- tools::file_path_sans_ext(basename(tif))
+  out_file <- file.path(out_dir, paste0(region_name, "_9km_summary.csv"))
+  
+  # 保存CSV
+  write.csv(df, out_file, row.names = FALSE, na = "NA")
+  
+  cat("已处理并保存:", out_file, "\n")
+}
+
+cat("✅ 所有区域完成9km聚合并导出CSV！\n")
+
+# ------------------------------------------------------------------------批量数据清洗
+library(stringr)
+
+# 1. 文件夹路径
+csv_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020_six_region/summary_day_csv"
+out_dir <- file.path(csv_dir, "clean")
+if(!dir.exists(out_dir)) dir.create(out_dir)
+
+# 2. 获取所有CSV文件
+csv_files <- list.files(csv_dir, pattern = "\\.csv$", full.names = TRUE)
+
+# 3. 提取区域标识（EA、NE、NW...）
+# 文件命名格式：HumLST_2020_day_XX_9km_summary.csv
+regions <- unique(str_extract(basename(csv_files), "_(EA|NE|NW|NO|SO|SW)_"))
+regions <- gsub("_", "", regions)  # 去掉下划线
+
+# 4. 循环每个区域处理
+for (region in regions) {
+  # 找到当前区域对应的两个文件（Hum & Nat）
+  hum_file <- csv_files[grepl(paste0("Hum.*", region), csv_files)]
+  nat_file <- csv_files[grepl(paste0("Nat.*", region), csv_files)]
+  
+  if (length(hum_file) == 1 && length(nat_file) == 1) {
+    cat("处理区域:", region, "\n")
+    
+    # 读取数据
+    hum <- read.csv(hum_file)
+    nat <- read.csv(nat_file)
+    
+    # 检查行数一致
+    if (nrow(hum) != nrow(nat)) {
+      warning("文件行数不一致：", hum_file, " & ", nat_file)
+    }
+    
+    # 找到两个文件中都完整的行
+    valid_rows <- complete.cases(hum) & complete.cases(nat)
+    
+    # 筛选
+    hum_clean <- hum[valid_rows, ]
+    nat_clean <- nat[valid_rows, ]
+    
+    # 输出文件名
+    hum_out <- file.path(out_dir, paste0("Hum_", region, "_clean.csv"))
+    nat_out <- file.path(out_dir, paste0("Nat_", region, "_clean.csv"))
+    
+    write.csv(hum_clean, hum_out, row.names = FALSE)
+    write.csv(nat_clean, nat_out, row.names = FALSE)
+    
+    cat("✅ 已输出:", hum_out, " 和 ", nat_out, "\n")
+  } else {
+    warning("区域 ", region, " 找不到完整的Hum/Nat文件！")
+  }
+}
+
+cat("✅ 所有区域处理完成，结果保存在: ", out_dir, "\n")
+
+# ------------------------------------------------------------------------------分区差值作图
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv/clean/Hum_NE_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv/clean/Nat_NE_clean.csv")
+
+# 2. 取mean列，计算插值（差值）
+interpolation <- hum_clean$mean - nat_clean$mean
+
+# 2.1 进行配对 t 检验（假设每个 Hum 与 Nat 栅格一一对应）
+hum_mean <- hum_clean$mean
+nat_mean <- nat_clean$mean
+
+t_test_result <- t.test(hum_mean, nat_mean)  # 默认 paired=FALSE
+cat("T 检验结果：\n")
+print(t_test_result)
+cat("p值 =", t_test_result$p.value, "\n")
+
+
+# 3. 计算插值的中位数和95%分位数范围
+median_val <- median(interpolation, na.rm = TRUE)
+x_min <- quantile(interpolation, 0.025, na.rm = TRUE)
+x_max <- quantile(interpolation, 0.975, na.rm = TRUE)
+
+# 打印中位数到控制台
+cat("插值的中位数 =", round(median_val, 4), "\n")
+
+# 4. 构造数据框（ggplot要求）
+df_interp <- data.frame(interpolation = interpolation)
+
+# 5. 绘图
+p <- ggplot(df_interp, aes(x = interpolation)) +
+  geom_density(color = "#1f77b4", linewidth = 1.2) +
+  geom_vline(xintercept = median_val, color = "#ff7f0e", linetype = "dashed", linewidth = 1) +
+  coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, 0.7)) +   # 限制横纵坐标范围
+  labs(x = "∆LST(℃)", y = "Density") +
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.line = element_line(color = "black", linewidth = 1),
+    axis.ticks = element_line(color = "black", linewidth = 1),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+# 6. 显示图形
+print(p)
+# 7. （可选）保存图像到本地路径
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST2.0/LST_2020_six_region/summary_day_csv/clean/∆LST_day_2020_NE.png",
+       plot = p, width = 10, height = 9, dpi = 600, bg = "white")
+# ------------------------------------------------------------------------------分区差值作图优化版
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv/clean/Hum_SO_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv/clean/Nat_SO_clean.csv")
+
+# 2. 取mean列，计算插值（差值）
+interpolation <- hum_clean$mean - nat_clean$mean
+# 2.1 进行配对 t 检验（假设每个 Hum 与 Nat 栅格一一对应）
+hum_mean <- hum_clean$mean
+nat_mean <- nat_clean$mean
+
+t_test_result <- t.test(hum_mean, nat_mean, paired = TRUE)  # 默认 paired=FALSE
+cat("T 检验结果：\n")
+print(t_test_result)
+cat("p值 =", t_test_result$p.value, "\n")
+
+
+# 3. 计算比例（小于0和大于0）
+prop_less_0 <- mean(interpolation < 0, na.rm = TRUE)
+prop_greater_0 <- mean(interpolation > 0, na.rm = TRUE)
+
+cat("小于 0 的比例 =", round(prop_less_0, 3), "\n")
+cat("大于 0 的比例 =", round(prop_greater_0, 3), "\n")
+
+# 4. 计算95%分位数范围（用于坐标限制）
+x_min <- quantile(interpolation, 0.025, na.rm = TRUE)
+x_max <- quantile(interpolation, 0.975, na.rm = TRUE)
+# 5. 计算密度曲线
+dens <- density(interpolation, na.rm = TRUE)
+df_dens <- data.frame(x = dens$x, y = dens$y)
+
+# 6. 绘图
+p <- ggplot() +
+  # 左边填充 (x < 0, 更浅)
+  geom_area(data = subset(df_dens, x < 0),
+            aes(x = x, y = y), fill = "orange", alpha = 0.4) +
+  # 右边填充 (x >= 0, 更深)
+  geom_area(data = subset(df_dens, x >= 0),
+            aes(x = x, y = y), fill = "orange", alpha = 0.8) +
+  # 黑色虚线 x=0
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1.5) +
+  coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, 0.7)) +   # 限制横纵坐标范围
+#  coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, max(df_dens$y) * 1.05)) +
+  #labs(x = "∆LST(℃)", y = "Density") +
+  theme_minimal(base_size = 35) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 2.5), # 外边框加粗
+    axis.line = element_line(color = "black", linewidth = 1.0),
+    axis.ticks = element_line(color = "black", linewidth = 1.0),
+    axis.text = element_text(color = "black", size = 35),
+    #axis.title = element_text(color = "black", size = 35),
+    axis.title = element_blank(),                           # 隐藏坐标标题
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+# 7. 显示图形
+print(p)
+
+# 8. 保存图像
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/∆LST_day_2020_SO_优化版.png",
+       plot = p, width = 10, height = 9, dpi = 600, bg = "white")
+# ------------------------------------------------------------------------------分区叠加曲线
+# 加载包
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv/clean/Hum_NO_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv/clean/Nat_NO_clean.csv")
+
+# 2. 提取 mean 列并合并数据框
+hum_df <- data.frame(mean = hum_clean$mean, type = "Hum")
+nat_df <- data.frame(mean = nat_clean$mean, type = "Nat")
+df_all <- rbind(hum_df, nat_df)
+
+hum_mean <- hum_df$mean
+nat_mean <- nat_df$mean
+
+# 3. t 检验
+t_test_result <- t.test(hum_mean, nat_mean, paired = TRUE)
+cat("T 检验结果：\n")
+print(t_test_result)
+
+# 4. 计算中位数与均值
+median_hum <- median(hum_mean, na.rm = TRUE)
+median_nat <- median(nat_mean, na.rm = TRUE)
+mean_hum   <- mean(hum_mean, na.rm = TRUE)
+mean_nat   <- mean(nat_mean, na.rm = TRUE)
+
+cat("\nHum:\n")
+cat("  中位数 =", round(median_hum, 3), "\n")
+cat("  均值   =", round(mean_hum, 3), "\n\n")
+
+cat("Nat:\n")
+cat("  中位数 =", round(median_nat, 3), "\n")
+cat("  均值   =", round(mean_nat, 3), "\n\n")
+
+# 5. 核密度估计，用于确定注释Y值
+dens_hum <- density(hum_mean, na.rm = TRUE)
+dens_nat <- density(nat_mean, na.rm = TRUE)
+
+# 6. 绘图：ggplot2 频率分布曲线
+p <- ggplot(df_all, aes(x = mean, color = type)) +
+  geom_density(linewidth = 1.0) +
+  
+  # 添加中位数虚线
+  geom_vline(xintercept = median_hum, linetype = "dashed", color = "#cc4c02", linewidth = 1) +
+  geom_vline(xintercept = median_nat, linetype = "dashed", color = "#01665e", linewidth = 1) +
+  
+  # 坐标轴标签
+  labs(x = "LST(℃)", y = "Density") +
+  
+  coord_cartesian(ylim = c(0, 0.25)) +
+  
+  # 颜色手动设定
+  scale_color_manual(values = c("Hum" = "#cc4c02", "Nat" = "#01665e")) +
+  
+  # 精细化主题设置
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",              # 去掉图例
+    panel.grid = element_blank(),          # 去掉网格线
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),  # 添加外框
+    axis.line = element_line(color = "black", linewidth = 1),                # 添加坐标轴线段
+    axis.ticks = element_line(color = "black", linewidth = 1)                # 坐标轴刻度线
+  )
+
+print(p)
+ggsave(
+  filename = "D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv/clean/LST_day_2020_NO.png",
+  plot = p,
+  width = 10, height = 9, dpi = 600, bg = "white"
+)
+
+
+# ============================================================================================================================================================= core
+# ------------------------------------------------------------------------------Hum/Nat edge掩膜提取
+rm(list = ls())
+gc(reset = TRUE)
+
+library(terra)
+
+# 1. 读取掩膜栅格
+mask_path <- "D:/Forest_Fragmentation/人为和自然归因/Edge_raster/Hum_core_raw/2020_1km/Hum_core_2020.tif"
+mask <- rast(mask_path)
+
+# 2. 读取 LST 栅格（2020 年均值，已为真实值）
+lst_path <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/China_LST_day_2020.tif"
+lst <- rast(lst_path)
+
+# 3. 检查 CRS 是否一致，不一致则重投影 lst 到 mask 的 CRS
+if (!compareGeom(lst, mask, crs = TRUE, stopOnError = FALSE)) {
+  message("CRS 不一致，进行重投影...")
+  lst <- project(vpd, mask, method = "near")
+} else {
+  message("CRS 一致，无需重投影")
+}
+
+# 4. 重采样对齐（确保栅格分辨率和范围匹配）
+lst_aligned <- resample(lst, mask, method = "near")
+
+# 5. 掩膜操作（保留 mask == 1 区域，其他设 NA）
+lst_masked <- mask(lst_aligned, mask, maskvalues = 0, updatevalue = NA)
+
+# 6. 输出路径
+output_path <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020.tif"
+
+# 7. 写出结果，保存为浮点型
+writeRaster(lst_masked, output_path, datatype = "FLT4S", NAflag = -9999, overwrite = TRUE)
+
+cat("✅ 掩膜后的 VST数据已保存至：", output_path, "\n")
+
+# ------------------------------------------------------------------------------9km聚合提取
+library(terra)
+
+# 1. 读取你的 1km 栅格数据
+r <- rast("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020.tif")
+
+# 2. 设置聚合因子（假设原图是1km）
+fact <- 9
+
+# 3. 聚合栅格，分别计算四个统计量
+r_max    <- aggregate(r, fact=fact, fun=max,    na.rm=TRUE)
+r_min    <- aggregate(r, fact=fact, fun=min,    na.rm=TRUE)
+r_mean   <- aggregate(r, fact=fact, fun=mean,   na.rm=TRUE)
+r_median <- aggregate(r, fact=fact, fun=median, na.rm=TRUE)
+
+# 4. 合并成一个多波段栅格
+r_summary <- c(r_max, r_min, r_mean, r_median)
+names(r_summary) <- c("max", "min", "mean", "median")
+
+# 5. 提取所有格网的中心坐标和统计值（保留NA格）
+df <- as.data.frame(r_summary, xy=TRUE, na.rm=FALSE)
+
+# 6. 保存为CSV
+write.csv(df, "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020_9km.csv", row.names=FALSE, na = "NA")
+
+
+# ------------------------------------------------------------------------------9km聚合提取类型合并，去除NA
+# 1. 读取两个 CSV 文件
+hum <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020_9km.csv")
+nat <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/NatCore_LST_day_2020_9km.csv")
+
+# 2. 找出两个文件中都没有 NA 的行（逐行检查）
+# 完整无NA的逻辑：每一行在两个表中都不含NA
+valid_rows <- complete.cases(hum) & complete.cases(nat)
+
+# 3. 筛选出无NA的行
+hum_clean <- hum[valid_rows, ]
+nat_clean <- nat[valid_rows, ]
+
+# 4. 可选：检查筛选结果的行数是否一致
+stopifnot(nrow(hum_clean) == nrow(nat_clean))
+
+# 5. 写出为新的CSV文件
+write.csv(hum_clean, "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020_9km_clean.csv", row.names=FALSE)
+write.csv(nat_clean, "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/NatCore_LST_day_2020_9km_clean.csv", row.names=FALSE)
+
+# ------------------------------------------------------------------------------差值作图
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020_9km_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/NatCore_LST_day_2020_9km_clean.csv")
+
+# 2. 取mean列，计算插值（差值）
+interpolation <- hum_clean$mean - nat_clean$mean
+
+# 3. 计算插值的中位数和95%分位数范围
+median_val <- median(interpolation, na.rm = TRUE)
+x_min <- quantile(interpolation, 0.025, na.rm = TRUE)
+x_max <- quantile(interpolation, 0.975, na.rm = TRUE)
+
+# 打印中位数到控制台
+cat("插值的中位数 =", round(median_val, 4), "\n")
+
+# 4. 构造数据框（ggplot要求）
+df_interp <- data.frame(interpolation = interpolation)
+
+# 5. 绘图
+p <- ggplot(df_interp, aes(x = interpolation)) +
+  geom_density(color = "#1f77b4", linewidth = 1.2) +
+  geom_vline(xintercept = median_val, color = "#ff7f0e", linetype = "dashed", linewidth = 1) +
+  coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, 0.7)) +   # 限制横纵坐标范围
+  labs(x = "∆LST(℃)", y = "Density") +
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.line = element_line(color = "black", linewidth = 1),
+    axis.ticks = element_line(color = "black", linewidth = 1),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+
+# 6. 显示图形
+print(p)
+# 7. （可选）保存图像到本地路径
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/∆LST_day_2020.png",
+       plot = p, width = 10, height = 9, dpi = 600, bg = "white")
+
+# ------------------------------------------------------------------------------分区裁剪
+library(terra)
+
+# 1. 输入路径
+shp_dir <- "D:/Forest_Fragmentation/中国标准地图-审图号GS(2020)4619号-shp格式/六大地理分区"
+tif_path <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020.tif"
+out_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020_six_region/HumLST_day_2020_region"
+
+# 创建输出文件夹（如果不存在）
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# 2. 读取参考tif
+r <- rast(tif_path)
+
+# 3. 获取所有shp文件路径
+shp_files <- list.files(shp_dir, pattern = "\\.shp$", full.names = TRUE)
+
+# 检查
+print(shp_files)
+
+# 4. 批量裁剪并导出
+for (shp in shp_files) {
+  # 读取shp
+  region <- vect(shp)
+  
+  # 将shp投影转换到栅格坐标系
+  region <- project(region, crs(r))
+  
+  # 裁剪
+  r_crop <- crop(r, region, mask = TRUE)
+  
+  # 生成输出文件名（根据shp文件名）
+  region_name <- tools::file_path_sans_ext(basename(shp))  # 取文件名去掉扩展名
+  out_file <- file.path(out_dir, paste0("HumLST_2020_day_", region_name, ".tif"))
+  
+  # 保存
+  writeRaster(r_crop, out_file, overwrite = TRUE)
+  
+  cat("已保存:", out_file, "\n")
+}
+
+cat("✅ 所有6个分区裁剪完成！\n")
+
+# ------------------------------------------------------------------------------批量聚合
+library(terra)
+
+# 1. 输入目录
+tif_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020_six_region/HumLST_day_2020_region"
+out_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020_six_region/summary_day_csv"
+
+# 创建输出文件夹（如果不存在）
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# 2. 获取所有TIF文件路径
+tif_files <- list.files(tif_dir, pattern = "\\.tif$", full.names = TRUE)
+
+# 检查
+print(tif_files)
+
+# 3. 设置聚合因子（假设原始分辨率是1km -> 9km）
+fact <- 9
+
+# 4. 批量处理
+for (tif in tif_files) {
+  # 读取栅格
+  r <- rast(tif)
+  
+  # 计算四个统计量
+  r_max    <- aggregate(r, fact=fact, fun=max,    na.rm=TRUE)
+  r_min    <- aggregate(r, fact=fact, fun=min,    na.rm=TRUE)
+  r_mean   <- aggregate(r, fact=fact, fun=mean,   na.rm=TRUE)
+  r_median <- aggregate(r, fact=fact, fun=median, na.rm=TRUE)
+  
+  # 合并为多波段栅格
+  r_summary <- c(r_max, r_min, r_mean, r_median)
+  names(r_summary) <- c("max", "min", "mean", "median")
+  
+  # 转换为数据框，保留NA格
+  df <- as.data.frame(r_summary, xy=TRUE, na.rm=FALSE)
+  
+  # 生成输出文件名（基于TIF文件名）
+  region_name <- tools::file_path_sans_ext(basename(tif))
+  out_file <- file.path(out_dir, paste0(region_name, "_9km_summary.csv"))
+  
+  # 保存CSV
+  write.csv(df, out_file, row.names = FALSE, na = "NA")
+  
+  cat("已处理并保存:", out_file, "\n")
+}
+
+cat("✅ 所有区域完成9km聚合并导出CSV！\n")
+
+# ------------------------------------------------------------------------------叠加曲线
+# 加载包
+library(ggplot2)
+
+# 1. 读取两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/HumCore_LST_day_2020_9km_clean.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/NatCore_LST_day_2020_9km_clean.csv")
+
+# 2. 提取 mean 列并合并数据框
+hum_df <- data.frame(mean = hum_clean$mean, type = "Hum")
+nat_df <- data.frame(mean = nat_clean$mean, type = "Nat")
+df_all <- rbind(hum_df, nat_df)
+
+hum_mean <- hum_df$mean
+nat_mean <- nat_df$mean
+
+# 3. t 检验
+t_test_result <- t.test(hum_mean, nat_mean)
+cat("T 检验结果：\n")
+print(t_test_result)
+
+# 4. 计算中位数与均值
+median_hum <- median(hum_mean, na.rm = TRUE)
+median_nat <- median(nat_mean, na.rm = TRUE)
+mean_hum   <- mean(hum_mean, na.rm = TRUE)
+mean_nat   <- mean(nat_mean, na.rm = TRUE)
+
+cat("\nHum:\n")
+cat("  中位数 =", round(median_hum, 3), "\n")
+cat("  均值   =", round(mean_hum, 3), "\n\n")
+
+cat("Nat:\n")
+cat("  中位数 =", round(median_nat, 3), "\n")
+cat("  均值   =", round(mean_nat, 3), "\n\n")
+
+# 5. 核密度估计，用于确定注释Y值
+dens_hum <- density(hum_mean, na.rm = TRUE)
+dens_nat <- density(nat_mean, na.rm = TRUE)
+
+# 6. 绘图：ggplot2 频率分布曲线
+p <- ggplot(df_all, aes(x = mean, color = type)) +
+  geom_density(linewidth = 1.0) +
+  
+  # 添加中位数虚线
+  geom_vline(xintercept = median_hum, linetype = "dashed", color = "#cc4c02", linewidth = 1) +
+  geom_vline(xintercept = median_nat, linetype = "dashed", color = "#01665e", linewidth = 1) +
+  
+  # 坐标轴标签
+  labs(x = "LST(℃)", y = "Density") +
+  
+  coord_cartesian(ylim = c(0, 0.25)) +
+  
+  # 颜色手动设定
+  scale_color_manual(values = c("Hum" = "#cc4c02", "Nat" = "#01665e")) +
+  
+  # 精细化主题设置
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",              # 去掉图例
+    panel.grid = element_blank(),          # 去掉网格线
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),  # 添加外框
+    axis.line = element_line(color = "black", linewidth = 1),                # 添加坐标轴线段
+    axis.ticks = element_line(color = "black", linewidth = 1)                # 坐标轴刻度线
+  )
+
+print(p)
+ggsave(
+  filename = "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020/LST_day_2020.png",
+  plot = p,
+  width = 10, height = 9, dpi = 600, bg = "white"
+)
+
+
+
+# ============================================================================================================================================================= edge&core
+# ------------------------------------------------------------------------------ 9km 聚合提取类型合并，去除 NA（四个文件同步）
+# 1. 读取四个 CSV 文件
+hum_core <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumCore_LST_day_2020_9km.csv")
+hum_edge <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumEdge_LST_day_2020_9km.csv")
+nat_core <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatCore_LST_day_2020_9km.csv")
+nat_edge <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatEdge_LST_day_2020_9km.csv")
+
+# 2. 找出所有文件中都没有 NA 的行
+valid_rows <- complete.cases(hum_core) & complete.cases(hum_edge) & complete.cases(nat_core) & complete.cases(nat_edge)
+
+# 3. 筛选出无 NA 的行
+hum_core_clean <- hum_core[valid_rows, ]
+hum_edge_clean <- hum_edge[valid_rows, ]
+nat_core_clean <- nat_core[valid_rows, ]
+nat_edge_clean <- nat_edge[valid_rows, ]
+
+# 4. 可选检查行数是否一致
+stopifnot(
+  nrow(hum_core_clean) == nrow(hum_edge_clean),
+  nrow(hum_edge_clean) == nrow(nat_core_clean),
+  nrow(nat_core_clean) == nrow(nat_edge_clean)
+)
+
+# 5. 写出为新的 CSV 文件
+write.csv(hum_core_clean, "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumCore_LST_day_2020_9km_clean2.0.csv", row.names = FALSE)
+write.csv(hum_edge_clean, "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumEdge_LST_day_2020_9km_clean2.0.csv", row.names = FALSE)
+write.csv(nat_core_clean, "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatCore_LST_day_2020_9km_clean2.0.csv", row.names = FALSE)
+write.csv(nat_edge_clean, "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatEdge_LST_day_2020_9km_clean2.0.csv", row.names = FALSE)
+
+# ------------------------------------------------------------------------------ 逐列差值（Edge - Core）
+# 1. 读取两个清洗后的 CSV 文件
+hum_core_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumCore_LST_day_2020_9km_clean2.0.csv")
+hum_edge_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumEdge_LST_day_2020_9km_clean2.0.csv")
+
+# 2. 检查行列是否匹配
+stopifnot(nrow(hum_core_clean) == nrow(hum_edge_clean))
+stopifnot(ncol(hum_core_clean) == ncol(hum_edge_clean))
+
+# 3. 前两列为坐标，直接保留；从第3列开始做差值
+coord_cols <- hum_edge_clean[, 1:2]
+diff_cols <- hum_edge_clean[, 3:ncol(hum_edge_clean)] - hum_core_clean[, 3:ncol(hum_core_clean)]
+
+# 4. 合并坐标列和差值列
+hum_diff_all <- cbind(coord_cols, diff_cols)
+
+# 5. 输出结果到新文件
+write.csv(hum_diff_all, "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumEdge_minus_Core_2020_9km.csv", row.names = FALSE)
+
+
+# ------------------------------------------------------------------------------差值作图优化版
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumEdge_minus_Core_2020_9km.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatEdge_minus_Core_2020_9km.csv")
+
+# 2. 取mean列，计算插值（差值）
+interpolation <- hum_clean$mean - nat_clean$mean
+
+# 3. 计算比例（小于0和大于0）
+prop_less_0 <- mean(interpolation < 0, na.rm = TRUE)
+prop_greater_0 <- mean(interpolation > 0, na.rm = TRUE)
+
+cat("小于 0 的比例 =", round(prop_less_0, 3), "\n")
+cat("大于 0 的比例 =", round(prop_greater_0, 3), "\n")
+
+# 4. 计算95%分位数范围（用于坐标限制）
+x_min <- quantile(interpolation, 0.025, na.rm = TRUE)
+x_max <- quantile(interpolation, 0.975, na.rm = TRUE)
+# 5. 计算密度曲线
+dens <- density(interpolation, na.rm = TRUE)
+df_dens <- data.frame(x = dens$x, y = dens$y)
+
+# 6. 绘图
+p <- ggplot() +
+  # 左边填充 (x < 0, 更浅)
+  geom_area(data = subset(df_dens, x < 0),
+            aes(x = x, y = y), fill = "skyblue", alpha = 0.4) +
+  # 右边填充 (x >= 0, 更深)
+  geom_area(data = subset(df_dens, x >= 0),
+            aes(x = x, y = y), fill = "skyblue", alpha = 0.8) +
+  # 黑色虚线 x=0
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1.5) +
+  coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, max(df_dens$y) * 1.05)) +
+  #labs(x = "∆LST(℃)", y = "Density") +
+  theme_minimal(base_size = 35) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 2.5), # 外边框加粗
+    axis.line = element_line(color = "black", linewidth = 1.0),
+    axis.ticks = element_line(color = "black", linewidth = 1.0),
+    axis.text = element_text(color = "black", size = 35),
+    #axis.title = element_text(color = "black", size = 35),
+    axis.title = element_blank(),                           # 隐藏坐标标题
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+# 7. 显示图形
+print(p)
+
+# 8. 保存图像
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/∆LST_day_edge&core_优化版.png",
+       plot = p, width = 10, height = 9, dpi = 600, bg = "white")
+# ------------------------------------------------------------------------------叠加曲线（差值版）
+library(ggplot2)
+
+# 1. 读取两个差值后的 CSV 文件
+hum_diff_all <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumEdge_minus_Core_2020_9km.csv")
+nat_diff_all <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatEdge_minus_Core_2020_9km.csv")
+
+# 2. 提取差值列的均值（可选：你可以选择某一列分析）
+hum_mean <- rowMeans(hum_diff_all[ , -(1:2)], na.rm = TRUE)  # 去除前两列坐标
+nat_mean <- rowMeans(nat_diff_all[ , -(1:2)], na.rm = TRUE)
+
+hum_df <- data.frame(mean = hum_mean, type = "Hum")
+nat_df <- data.frame(mean = nat_mean, type = "Nat")
+df_all <- rbind(hum_df, nat_df)
+
+# 3. t 检验
+t_test_result <- t.test(hum_mean, nat_mean, paired = TRUE)
+cat("T 检验结果：\n")
+print(t_test_result)
+
+# 4. 计算中位数与均值
+median_hum <- median(hum_mean, na.rm = TRUE)
+median_nat <- median(nat_mean, na.rm = TRUE)
+mean_hum   <- mean(hum_mean, na.rm = TRUE)
+mean_nat   <- mean(nat_mean, na.rm = TRUE)
+
+cat("\nHum:\n")
+cat("  中位数 =", round(median_hum, 3), "\n")
+cat("  均值   =", round(mean_hum, 3), "\n\n")
+
+cat("Nat:\n")
+cat("  中位数 =", round(median_nat, 3), "\n")
+cat("  均值   =", round(mean_nat, 3), "\n\n")
+
+# 5. 核密度估计（自动用于坐标轴调整）
+dens_hum <- density(hum_mean, na.rm = TRUE)
+dens_nat <- density(nat_mean, na.rm = TRUE)
+
+# 6. 绘图
+p <- ggplot(df_all, aes(x = mean, color = type)) +
+  geom_density(linewidth = 1.0) +
+  geom_vline(xintercept = median_hum, linetype = "dashed", color = "#FB8072", linewidth = 1) +
+  geom_vline(xintercept = median_nat, linetype = "dashed", color = "#5AB4AC", linewidth = 1) +
+  labs(x = "ΔLST (℃))", y = "Density") +
+  coord_cartesian(ylim = c(0, 0.8)) +
+  scale_color_manual(values = c("Hum" = "#FB8072", "Nat" = "#5AB4AC")) +
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.line = element_line(color = "black", linewidth = 1),
+    axis.ticks = element_line(color = "black", linewidth = 1)
+  )
+
+print(p)
+ggsave(
+  filename = "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/LST_EdgeMinusCore_day_2020_china.png",
+  plot = p,
+  width = 10, height = 9, dpi = 600, bg = "white"
+)
+
+# ------------------------------------------------------------------------------箱线图
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+# 1. 读取四个文件
+hum_core <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumCore_LST_day_2020_9km_clean2.0.csv")
+hum_edge <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/HumEdge_LST_day_2020_9km_clean2.0.csv")
+nat_core <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatCore_LST_day_2020_9km_clean2.0.csv")
+nat_edge <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/china清洗/NatEdge_LST_day_2020_9km_clean2.0.csv")
+
+# 2. 构造数据框
+df_hum_core  <- data.frame(mean = hum_core$mean, group = "Hum-Core")
+df_nat_core  <- data.frame(mean = nat_core$mean, group = "Nat-Core")
+df_hum_edge  <- data.frame(mean = hum_edge$mean, group = "Hum-Edge")
+df_nat_edge  <- data.frame(mean = nat_edge$mean, group = "Nat-Edge")
+df_all <- rbind(df_hum_core, df_nat_core, df_hum_edge, df_nat_edge)
+
+df_all %>%
+  group_by(group) %>%
+  summarise(median_value = format(round(median(mean, na.rm = TRUE), 2), nsmall = 2))
+
+# 3. 设置比较组
+my_comparisons <- list(
+  c("Hum-Core", "Nat-Core"),
+  c("Hum-Edge", "Nat-Edge"),
+  c("Hum-Core", "Hum-Edge"),
+  c("Nat-Core", "Nat-Edge")
+)
+
+
+# 4. 绘制箱线图 + 显著性比较
+p <- ggplot(df_all, aes(x = group, y = mean, fill = group)) +
+  geom_boxplot(width = 0.6, outlier.size = 0.75, linewidth = 1) +
+  scale_fill_manual(values = c(
+    "Hum-Core"  = "#E41A1C",
+    "Nat-Core"  = "#377EB8",
+    "Hum-Edge"  = "#cc4c02",
+    "Nat-Edge"  = "#01665e"
+  )) +
+  labs(x = NULL, y = "LST (°C)") +
+  coord_cartesian(ylim = c(NA, 50)) +  
+  theme_minimal(base_size = 35) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 2.5), # 外框加粗
+    axis.line = element_line(color = "black", linewidth = 1.5),   # 坐标轴线加粗
+    axis.ticks = element_line(color = "black", linewidth = 1.2),
+    axis.text = element_text(color = "black", size = 35),          # 横纵坐标字体黑色
+    axis.title = element_text(color = "black", size = 35),
+    axis.text.x = element_text(angle = 48, hjust = 1, color = "black"),  # 横坐标文字黑色
+    legend.position = "none"
+  ) +
+  stat_compare_means(
+    comparisons = my_comparisons, 
+    method = "t.test", 
+    label = "p.signif",
+    step.increase = 0.1,
+    size = 10,    # 显著性符号字体大小
+    tip.length = 0.01
+  )
+
+# 5. 显示图
+print(p)
+
+
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/LST_China_day_2020_2.0.png",
+       plot = p, width = 10, height = 10, dpi = 600 ,bg = "white")
+
+
+# ------------------------------------------------------------------------------ 9km 聚合提取类型合并，去除 NA（四个文件同步）批量
+library(stringr)
+
+# 1. 文件夹路径
+hum_edge_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv"   # 人为边缘
+nat_edge_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_edge2.0/LST_2020_six_region/summary_day_csv"       # 自然边缘
+hum_core_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020_six_region/summary_day_csv"    # 人为核心
+nat_core_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_core/LST_2020_six_region/summary_day_csv"       # 自然核心
+
+# 2. 所有 CSV 文件
+hum_edge_files <- list.files(hum_edge_dir, pattern = "\\.csv$", full.names = TRUE)
+nat_edge_files <- list.files(nat_edge_dir, pattern = "\\.csv$", full.names = TRUE)
+hum_core_files <- list.files(hum_core_dir, pattern = "\\.csv$", full.names = TRUE)
+nat_core_files <- list.files(nat_core_dir, pattern = "\\.csv$", full.names = TRUE)
+
+# 3. 区域代号
+regions <- c("EA", "NE", "NW", "NO", "SO", "SW")
+
+# 4. 输出路径
+out_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+# 5. 清洗每个区域
+for (region in regions) {
+  # 构造文件名匹配（注意匹配 summary 和 edge 文件）
+  hum_core_file <- hum_core_files[str_detect(hum_core_files, paste0("HumLST_2020_day_", region, "_9km_summary\\.csv"))]
+  hum_edge_file <- hum_edge_files[str_detect(hum_edge_files, paste0("HumLST_2020_day_", region, "_9km_summary\\.csv"))]
+  nat_core_file <- nat_core_files[str_detect(nat_core_files, paste0("NatLST_2020_day_", region, "_9km_summary\\.csv"))]
+  nat_edge_file <- nat_edge_files[str_detect(nat_edge_files, paste0("NatLST_2020_day_", region, "_9km_summary\\.csv"))]
+  
+  # 检查文件存在
+  if (length(hum_core_file) == 0 | length(hum_edge_file) == 0 | 
+      length(nat_core_file) == 0 | length(nat_edge_file) == 0) {
+    warning("⚠️ 缺失某些区域文件：", region)
+    next
+  }
+  
+  # 读取 CSV
+  hum_core <- read.csv(hum_core_file)
+  hum_edge <- read.csv(hum_edge_file)
+  nat_core <- read.csv(nat_core_file)
+  nat_edge <- read.csv(nat_edge_file)
+  
+  # 清洗：四个文件中都完整的行
+  valid_rows <- complete.cases(hum_core) & complete.cases(hum_edge) &
+    complete.cases(nat_core) & complete.cases(nat_edge)
+  
+  hum_core_clean <- hum_core[valid_rows, ]
+  hum_edge_clean <- hum_edge[valid_rows, ]
+  nat_core_clean <- nat_core[valid_rows, ]
+  nat_edge_clean <- nat_edge[valid_rows, ]
+  
+  # 写出
+  write.csv(hum_core_clean, file.path(out_dir, paste0("HumCore_", region, "_clean.csv")), row.names = FALSE)
+  write.csv(hum_edge_clean, file.path(out_dir, paste0("HumEdge_", region, "_clean.csv")), row.names = FALSE)
+  write.csv(nat_core_clean, file.path(out_dir, paste0("NatCore_", region, "_clean.csv")), row.names = FALSE)
+  write.csv(nat_edge_clean, file.path(out_dir, paste0("NatEdge_", region, "_clean.csv")), row.names = FALSE)
+  
+  message("✅ 完成区域：", region)
+}
+
+# ------------------------------------------------------------------------------ 批量计算 Edge - Core 差值代码如下
+library(stringr)
+
+# 设置输入输出路径
+input_dir  <- "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗"
+output_dir <- "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗"
+
+# 设置区域名称
+regions <- c("EA", "NE", "NW", "NO", "SO", "SW")
+types   <- c("Hum", "Nat")
+
+# 批量处理
+for (region in regions) {
+  for (type in types) {
+    
+    # 构造文件名
+    core_file <- file.path(input_dir, paste0(type, "Core_", region, "_clean.csv"))
+    edge_file <- file.path(input_dir, paste0(type, "Edge_", region, "_clean.csv"))
+    
+    # 读取 CSV
+    core_data <- read.csv(core_file)
+    edge_data <- read.csv(edge_file)
+    
+    # 检查维度一致
+    stopifnot(nrow(core_data) == nrow(edge_data))
+    stopifnot(ncol(core_data) == ncol(edge_data))
+    
+    # 计算差值
+    coord_cols <- edge_data[, 1:2]
+    diff_cols <- edge_data[, 3:ncol(edge_data)] - core_data[, 3:ncol(core_data)]
+    diff_data <- cbind(coord_cols, diff_cols)
+    
+    # 写入结果
+    output_file <- file.path(output_dir, paste0(type, "Edge_minus_Core_LST_day_", region, "_9km.csv"))
+    write.csv(diff_data, output_file, row.names = FALSE)
+    
+    cat("✅ 已处理：", output_file, "\n")
+  }
+}
+# ------------------------------------------------------------------------------差值作图优化版
+library(ggplot2)
+
+# 1. 读取清理后无NA的两个CSV文件
+hum_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/HumEdge_minus_Core_LST_day_EA_9km.csv")
+nat_clean <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/NatEdge_minus_Core_LST_day_EA_9km.csv")
+
+hum_mean <- hum_clean$mean
+nat_mean <- nat_clean$mean
+
+# 配对 t 检验
+t_test_result <- t.test(hum_mean, nat_mean, paired = TRUE)
+
+#  查看结果
+print(t_test_result)
+
+# 2. 取mean列，计算插值（差值）
+interpolation <- hum_clean$mean - nat_clean$mean
+# 3. 计算比例（小于0和大于0）
+prop_less_0 <- mean(interpolation < 0, na.rm = TRUE)
+prop_greater_0 <- mean(interpolation > 0, na.rm = TRUE)
+
+cat("小于 0 的比例 =", round(prop_less_0, 3), "\n")
+cat("大于 0 的比例 =", round(prop_greater_0, 3), "\n")
+
+# 4. 计算95%分位数范围（用于坐标限制）
+x_min <- quantile(interpolation, 0.025, na.rm = TRUE)
+x_max <- quantile(interpolation, 0.975, na.rm = TRUE)
+# 5. 计算密度曲线
+dens <- density(interpolation, na.rm = TRUE)
+df_dens <- data.frame(x = dens$x, y = dens$y)
+
+# 6. 绘图
+p <- ggplot() +
+  # 左边填充 (x < 0, 更浅)
+  geom_area(data = subset(df_dens, x < 0),
+            aes(x = x, y = y), fill = "skyblue", alpha = 0.4) +
+  # 右边填充 (x >= 0, 更深)
+  geom_area(data = subset(df_dens, x >= 0),
+            aes(x = x, y = y), fill = "skyblue", alpha = 0.8) +
+  # 黑色虚线 x=0
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1.5) +
+  coord_cartesian(ylim = c(0, 0.7)) +
+  #coord_cartesian(xlim = c(x_min, x_max), ylim = c(0, max(df_dens$y) * 1.05)) +
+  #labs(x = "∆LST(℃)", y = "Density") +
+  theme_minimal(base_size = 35) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 2.5), # 外边框加粗
+    axis.line = element_line(color = "black", linewidth = 1.0),
+    axis.ticks = element_line(color = "black", linewidth = 1.0),
+    axis.text = element_text(color = "black", size = 35),
+    #axis.title = element_text(color = "black", size = 35),
+    axis.title = element_blank(),                           # 隐藏坐标标题
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+# 7. 显示图形
+print(p)
+
+# 8. 保存图像
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/∆LST_day_edge&core_EA_优化版.png",
+       plot = p, width = 10, height = 9, dpi = 600, bg = "white")
+# ------------------------------------------------------------------------------叠加曲线（差值版）分区
+library(ggplot2)
+
+# 1. 读取两个差值后的 CSV 文件
+hum_diff_all <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/HumEdge_minus_Core_LST_day_NO_9km.csv")
+nat_diff_all <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/NatEdge_minus_Core_LST_day_NO_9km.csv")
+
+# 2. 提取差值列的均值（可选：你可以选择某一列分析）
+hum_mean <- rowMeans(hum_diff_all[ , -(1:2)], na.rm = TRUE)  # 去除前两列坐标
+nat_mean <- rowMeans(nat_diff_all[ , -(1:2)], na.rm = TRUE)
+
+hum_df <- data.frame(mean = hum_mean, type = "Hum")
+nat_df <- data.frame(mean = nat_mean, type = "Nat")
+df_all <- rbind(hum_df, nat_df)
+
+# 3. t 检验
+t_test_result <- t.test(hum_mean, nat_mean, paired = TRUE)
+cat("T 检验结果：\n")
+print(t_test_result)
+
+# 4. 计算中位数与均值
+median_hum <- median(hum_mean, na.rm = TRUE)
+median_nat <- median(nat_mean, na.rm = TRUE)
+mean_hum   <- mean(hum_mean, na.rm = TRUE)
+mean_nat   <- mean(nat_mean, na.rm = TRUE)
+
+cat("\nHum:\n")
+cat("  中位数 =", round(median_hum, 3), "\n")
+cat("  均值   =", round(mean_hum, 3), "\n\n")
+
+cat("Nat:\n")
+cat("  中位数 =", round(median_nat, 3), "\n")
+cat("  均值   =", round(mean_nat, 3), "\n\n")
+
+# 5. 核密度估计（自动用于坐标轴调整）
+dens_hum <- density(hum_mean, na.rm = TRUE)
+dens_nat <- density(nat_mean, na.rm = TRUE)
+
+# 6. 绘图
+p <- ggplot(df_all, aes(x = mean, color = type)) +
+  geom_density(linewidth = 1.0) +
+  geom_vline(xintercept = median_hum, linetype = "dashed", color = "#FB8072", linewidth = 1) +
+  geom_vline(xintercept = median_nat, linetype = "dashed", color = "#5AB4AC", linewidth = 1) +
+  labs(x = "ΔLST (℃))", y = "Density") +
+  coord_cartesian(ylim = c(0, 0.8)) +
+  scale_color_manual(values = c("Hum" = "#FB8072", "Nat" = "#5AB4AC")) +
+  theme_minimal(base_size = 32) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.line = element_line(color = "black", linewidth = 1),
+    axis.ticks = element_line(color = "black", linewidth = 1)
+  )
+
+print(p)
+ggsave(
+  filename = "D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/LST_EdgeMinusCore_day_2020_NO.png",
+  plot = p,
+  width = 10, height = 9, dpi = 600, bg = "white"
+)
+
+# ------------------------------------------------------------------------------箱线图分区
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+# 1. 读取四个文件
+hum_core <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/HumCore_EA_clean.csv")
+hum_edge <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/HumEdge_EA_clean.csv")
+nat_core <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/NatCore_EA_clean.csv")
+nat_edge <- read.csv("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/region清洗/NatEdge_EA_clean.csv")
+
+# 2. 构造数据框
+df_hum_core  <- data.frame(mean = hum_core$mean, group = "Hum-Core")
+df_nat_core  <- data.frame(mean = nat_core$mean, group = "Nat-Core")
+df_hum_edge  <- data.frame(mean = hum_edge$mean, group = "Hum-Edge")
+df_nat_edge  <- data.frame(mean = nat_edge$mean, group = "Nat-Edge")
+df_all <- rbind(df_hum_core, df_nat_core, df_hum_edge, df_nat_edge)
+
+df_all %>%
+  group_by(group) %>%
+  summarise(median_value = format(round(median(mean, na.rm = TRUE), 2), nsmall = 2))
+
+# 3. 设置比较组
+my_comparisons <- list(
+  c("Hum-Core", "Nat-Core"),
+  c("Hum-Edge", "Nat-Edge"),
+  c("Hum-Core", "Hum-Edge"),
+  c("Nat-Core", "Nat-Edge")
+)
+
+# 4. 绘制箱线图 + 显著性比较
+p <- ggplot(df_all, aes(x = group, y = mean, fill = group)) +
+  geom_boxplot(width = 0.6,outlier.size = 0.75, linewidth = 1) +
+  scale_fill_manual(values = c(
+    "Hum-Core"  = "#E41A1C",
+    "Nat-Core"  = "#377EB8",
+    "Hum-Edge"  = "#cc4c02",
+    "Nat-Edge"  = "#01665e"
+  )) +
+  labs(x = NULL, y = "LST (°C)") +
+  coord_cartesian(ylim = c(NA, 50)) +   # 限制纵坐标最大值为40
+  theme_minimal(base_size = 32) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1.5),
+    axis.line = element_blank(),  # 取消默认轴线
+    axis.ticks = element_line(color = "black", linewidth = 1.0),
+    axis.text.x = element_text(angle = 48, hjust = 1),  # 横坐标标签倾斜
+    legend.position = "none"
+  ) +
+  stat_compare_means(comparisons = my_comparisons, 
+                     method = "t.test", 
+                     label = "p.signif",
+                     step.increase = 0.1,
+                     size = 10,  # 修改显著性符号 * 的字体大小
+                     tip.length = 0.01)
+
+# 5. 显示图
+print(p)
+
+ggsave("D:/Forest_Fragmentation/人为和自然归因/LST_edge&core/LST_EA_day_2020.png",
+       plot = p, width = 10, height = 10, dpi = 600 ,bg = "white")
+
